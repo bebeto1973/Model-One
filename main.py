@@ -34,7 +34,7 @@ logger = logging.getLogger()
 # ==========================================
 # 2. MODULO AGGIORNAMENTO DATABASE
 # ==========================================
-def aggiorna_database_fondamentali(filepath='data/df_model.xlsx'):
+def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xlsx'):
     """
     Legge l'Excel, aggiorna i prezzi correnti tramite yfinance per ricalcolare i multipli
     e verifica se ci sono nuovi filing SEC da accodare.
