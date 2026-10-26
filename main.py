@@ -32,33 +32,37 @@ logging.basicConfig(level=logging.WARNING, format=log_format,
 logger = logging.getLogger()
 
 # ==========================================
-# 2. MODULO AGGIORNAMENTO DATABASE
+# 2. MODULO AGGIORNAMENTO DATABASE (Via Alpaca)
 # ==========================================
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
+
 def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xlsx'):
-    """
-    Legge l'Excel, aggiorna i prezzi correnti tramite yfinance per ricalcolare i multipli
-    e verifica se ci sono nuovi filing SEC da accodare.
-    """
-    logger.warning("🔄 Avvio aggiornamento Database...")
+    logger.warning("🔄 Avvio aggiornamento Database tramite Alpaca...")
     try:
         df = pd.read_excel(filepath)
         tickers = df['Ticker'].unique().tolist()
         
-        # Aggiornamento prezzi live per i calcoli di Market Cap ed EV
-        tickers_str = " ".join(tickers)
-        live_data = yf.download(tickers_str, period="1d", progress=False)['Close']
+        # Prevenzione errore: creiamo la colonna a zero per sicurezza
+        if 'Prezzo_Attuale' not in df.columns:
+            df['Prezzo_Attuale'] = 0.0
+
+        # Inizializza il client dati di Alpaca usando le tue chiavi esistenti
+        data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
         
-        # Aggiorna la colonna Prezzo_Attuale per i calcoli dei motori
-        for ticker in tickers:
+        # Alpaca gestisce benissimo le richieste, ma dividiamo i 500 ticker in piccoli blocchi 
+        # per evitare timeout di rete
+        chunk_size = 100
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i + chunk_size]
             try:
-                # Gestione del caso singolo o multi-ticker di yfinance
-                prezzo = live_data[ticker].iloc[-1] if isinstance(live_data, pd.DataFrame) else live_data.iloc[-1]
-                df.loc[df['Ticker'] == ticker, 'Prezzo_Attuale'] = float(prezzo)
-            except Exception:
-                pass
-        
-        # QUI: Inserisci la logica API se usi Financial Modeling Prep / SEC per 
-        # scaricare i nuovi 'Ricavi Totali (Discreto)' se la data di filing è > dell'ultima in db.
+                req = StockLatestTradeRequest(symbol_or_symbols=chunk)
+                trades = data_client.get_stock_latest_trade(req)
+                
+                for ticker, trade in trades.items():
+                    df.loc[df['Ticker'] == ticker, 'Prezzo_Attuale'] = float(trade.price)
+            except Exception as e:
+                logger.warning(f"⚠️ Errore download Alpaca per il blocco {chunk[0]}... : {e}")
         
         df.to_excel(filepath, index=False)
         logger.warning(f"✅ Database aggiornato con gli ultimi prezzi per {len(tickers)} ticker.")
