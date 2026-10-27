@@ -54,7 +54,8 @@ def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xl
         # per evitare timeout di rete
         chunk_size = 100
         for i in range(0, len(tickers), chunk_size):
-            chunk = tickers[i:i + chunk_size]
+            # Converte i trattini in punti per i ticker di classi speciali (es. BRK-B -> BRK.B)
+            chunk = [t.replace('-', '.') for t in tickers[i:i + chunk_size]]
             try:
                 req = StockLatestTradeRequest(symbol_or_symbols=chunk)
                 trades = data_client.get_stock_latest_trade(req)
