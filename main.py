@@ -105,92 +105,131 @@ def crea_portafoglio_barbell(df_scored):
     return df_long
 
 # ==========================================
-# 5. ESECUZIONE ORDINI SU ALPACA
+# 5. ESECUZIONE ORDINI A DELTA SU ALPACA
 # ==========================================
-def esegui_ordini_alpaca(df_portafoglio):
-    logger.warning("🤖 Connessione ad Alpaca in corso...")
+def esegui_ordini_alpaca_delta(df_portafoglio):
+    logger.warning("🤖 Connessione ad Alpaca e analisi posizioni attuali...")
     try:
-        logger.warning("🧹 Chiusura ordini e posizioni precedenti...")
-        trading_client.cancel_orders()
-        trading_client.close_all_positions(cancel_orders=True)
-        
         account = trading_client.get_account()
         equity = float(account.equity)
         logger.warning(f"💰 Equity Disponibile: ${equity:,.2f}")
         
+        # Mappa le posizioni attualmente aperte su Alpaca
+        posizioni_esistenti = {}
+        for p in trading_client.get_all_positions():
+            posizioni_esistenti[p.symbol] = {
+                'qty': float(p.qty),
+                'market_value': float(p.market_value),
+                'unrealized_plpc': float(p.unrealized_plpc) * 100  # in percentuale
+            }
+            
         ordini_eseguiti = []
+        simboli_target_long = [str(t).replace('-', '.') for t in df_portafoglio['Ticker'].tolist()]
         
-        # --- ORDINI LONG ---
+        # 1. Chiusura posizioni Long non più in target
+        for symbol in list(posizioni_esistenti.keys()):
+            if symbol not in simboli_target_long and symbol not in ['SPY', 'QQQ']:
+                try:
+                    trading_client.close_position(symbol)
+                    logger.warning(f"🔴 Chiusura posizione dismessa: {symbol}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Errore chiusura {symbol}: {e}")
+
+        # 2. Gestione ordini Long (Target 10% ciascuno)
         for index, row in df_portafoglio.iterrows():
             ticker = row['Ticker'].replace('-', '.')
             prezzo = float(row['Prezzo_Attuale'])
-            peso_decimale = row['Peso (%)'] / 100
-            importo_dollari = equity * peso_decimale
+            target_importo = equity * 0.10
+            target_qty = target_importo / prezzo if prezzo > 0 else 0
             
-            qty = round(importo_dollari / prezzo, 2) if prezzo > 0 else 0
+            qty_attuale = posizioni_esistenti.get(ticker, {}).get('qty', 0.0)
+            delta_qty = target_qty - qty_attuale
             
-            try:
-                req = MarketOrderRequest(
-                    symbol=ticker,
-                    notional=round(importo_dollari, 2),
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
-                )
-                trading_client.submit_order(order_data=req)
-                ordini_eseguiti.append({
-                    'Ticker': ticker,
-                    'Azione': 'BUY (Long)',
-                    'Prezzo ($)': round(prezzo, 2),
-                    'Quantità': qty,
-                    'Importo ($)': round(importo_dollari, 2)
-                })
-            except Exception as e:
-                logger.warning(f"❌ Errore ordine {ticker}: {e}")
+            # Soglia minima di scostamento per evitare micro-transazioni inutili (es. 1% del target)
+            if abs(delta_qty * prezzo) > (target_importo * 0.01):
+                side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
+                qty_da_trattare = abs(round(delta_qty, 2))
                 
-        # --- ORDINI SHORT (SPY e QQQ) ---
+                try:
+                    req = MarketOrderRequest(
+                        symbol=ticker,
+                        qty=qty_da_trattare,
+                        side=side,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    trading_client.submit_order(order_data=req)
+                    azione_str = 'BUY (Delta)' if side == OrderSide.BUY else 'SELL (Delta)'
+                    ordini_eseguiti.append({
+                        'Ticker': ticker,
+                        'Azione': azione_str,
+                        'Prezzo ($)': round(prezzo, 2),
+                        'Quantità': qty_da_trattare,
+                        'Importo ($)': round(qty_da_trattare * prezzo, 2),
+                        'PnL Inception (%)': f"{posizioni_esistenti.get(ticker, {}).get('unrealized_plpc', 0.0):.2f}%"
+                    })
+                except Exception as e:
+                    logger.warning(f"❌ Errore ordine delta {ticker}: {e}")
+            else:
+                # Se la posizione è già bilanciata, la includiamo nel report con il suo PnL
+                if ticker in posizioni_esistenti:
+                    ordini_eseguiti.append({
+                        'Ticker': ticker,
+                        'Azione': 'HOLD (Bilanciato)',
+                        'Prezzo ($)': round(prezzo, 2),
+                        'Quantità': round(qty_attuale, 2),
+                        'Importo ($)': round(qty_attuale * prezzo, 2),
+                        'PnL Inception (%)': f"{posizioni_esistenti[ticker]['unrealized_plpc']:.2f}%"
+                    })
+
+        # 3. Gestione Short su SPY e QQQ (Target 50% ciascuno)
         req_etf = StockLatestTradeRequest(symbol_or_symbols=['SPY', 'QQQ'])
         trades_etf = data_client.get_stock_latest_trade(req_etf)
         
-        prezzo_spy = float(trades_etf['SPY'].price)
-        prezzo_qqq = float(trades_etf['QQQ'].price)
-        
-        importo_short = equity * 0.50
-        
-        qty_spy = int(importo_short // prezzo_spy)
-        qty_qqq = int(importo_short // prezzo_qqq)
-        
-        try:
-            if qty_spy > 0:
-                req_spy = MarketOrderRequest(symbol='SPY', qty=qty_spy, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-                trading_client.submit_order(order_data=req_spy)
-                ordini_eseguiti.append({
-                    'Ticker': 'SPY',
-                    'Azione': 'SELL (Short)',
-                    'Prezzo ($)': round(prezzo_spy, 2),
-                    'Quantità': qty_spy,
-                    'Importo ($)': round(qty_spy * prezzo_spy, 2)
-                })
-        except Exception as e:
-            logger.warning(f"❌ Errore ordine SPY: {e}")
+        for etf_symbol in ['SPY', 'QQQ']:
+            prezzo_etf = float(trades_etf[etf_symbol].price)
+            target_importo_etf = equity * 0.50
+            target_qty_etf = int(target_importo_etf // prezzo_etf)
             
-        try:
-            if qty_qqq > 0:
-                req_qqq = MarketOrderRequest(symbol='QQQ', qty=qty_qqq, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-                trading_client.submit_order(order_data=req_qqq)
-                ordini_eseguiti.append({
-                    'Ticker': 'QQQ',
-                    'Azione': 'SELL (Short)',
-                    'Prezzo ($)': round(prezzo_qqq, 2),
-                    'Quantità': qty_qqq,
-                    'Importo ($)': round(qty_qqq * prezzo_qqq, 2)
-                })
-        except Exception as e:
-            logger.warning(f"❌ Errore ordine QQQ: {e}")
+            qty_attuale_etf = posizioni_esistenti.get(etf_symbol, {}).get('qty', 0.0)
+            # Nota: le quantità short su Alpaca sono negative nei registri delle posizioni
+            delta_qty_etf = -target_qty_etf - qty_attuale_etf 
             
-        # Sostituisce eventuali valori nulli con un trattino
+            if abs(delta_qty_etf) >= 1:
+                side_etf = OrderSide.SELL if delta_qty_etf < 0 else OrderSide.BUY
+                qty_trattata_etf = abs(int(delta_qty_etf))
+                
+                try:
+                    req_etf_order = MarketOrderRequest(
+                        symbol=etf_symbol,
+                        qty=qty_trattata_etf,
+                        side=side_etf,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    trading_client.submit_order(order_data=req_etf_order)
+                    ordini_eseguiti.append({
+                        'Ticker': etf_symbol,
+                        'Azione': f"SELL/BUY (Short Delta)",
+                        'Prezzo ($)': round(prezzo_etf, 2),
+                        'Quantità': qty_trattata_etf,
+                        'Importo ($)': round(qty_trattata_etf * prezzo_etf, 2),
+                        'PnL Inception (%)': f"{posizioni_esistenti.get(etf_symbol, {}).get('unrealized_plpc', 0.0):.2f}%"
+                    })
+                except Exception as e:
+                    logger.warning(f"❌ Errore ordine ETF {etf_symbol}: {e}")
+            else:
+                if etf_symbol in posizioni_esistenti:
+                    ordini_eseguiti.append({
+                        'Ticker': etf_symbol,
+                        'Azione': 'HOLD (Short Bilanciato)',
+                        'Prezzo ($)': round(prezzo_etf, 2),
+                        'Quantità': abs(round(qty_attuale_etf, 2)),
+                        'Importo ($)': round(abs(qty_attuale_etf) * prezzo_etf, 2),
+                        'PnL Inception (%)': f"{posizioni_esistenti[etf_symbol]['unrealized_plpc']:.2f}%"
+                    })
+                    
         return pd.DataFrame(ordini_eseguiti).fillna('-')
     except Exception as e:
-        logger.warning(f"❌ Errore generale in esecuzione ordini: {e}")
+        logger.warning(f"❌ Errore generale in esecuzione delta ordini: {e}")
         return None
 
 # ==========================================
@@ -205,7 +244,7 @@ def invia_email_report(df_ordini, df_portafoglio):
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
         msg['To'] = RECEIVER_EMAIL
-        msg['Subject'] = "📊 Report Barbell Quant - Esecuzione Completata"
+        msg['Subject'] = "📊 Report Barbell Quant (Delta Rebalancing) - Completato"
         
         if df_portafoglio is not None and not df_portafoglio.empty:
             colonne_utili = ['Ticker', 'Settore', 'Score', 'Rule of 40 (Proxy)', 'FCF Yield', 'Gross Margin (%)']
@@ -225,13 +264,13 @@ def invia_email_report(df_ordini, df_portafoglio):
         html = f"""
         <html>
           <body>
-            <h2>Resoconto Rebalancing Barbell Quantitativo</h2>
-            <p>Il bot ha aggiornato il database, calcolato gli score, liquidato le posizioni ed eseguito i nuovi ordini con successo.</p>
+            <h2>Resoconto Rebalancing Barbell (Delta & Performance)</h2>
+            <p>Il bot ha analizzato le posizioni esistenti, calcolato i delta di ribilanciamento per minimizzare le transazioni e aggiornato il report.</p>
             
-            <h3>Ordini Inseriti a Mercato:</h3>
-            {df_ordini.to_html(index=False, border=1) if df_ordini is not None and not df_ordini.empty else "<p>Nessun ordine eseguito.</p>"}
+            <h3>Azioni ed Esecuzioni Delta:</h3>
+            {df_ordini.to_html(index=False, border=1) if df_ordini is not None and not df_ordini.empty else "<p>Nessun movimento registrato.</p>"}
             
-            <h3>Fondamentali Top 10 (Motivazioni di acquisto):</h3>
+            <h3>Fondamentali Top 10 (Selezionate dal Modello):</h3>
             {html_fondamentali}
           </body>
         </html>
@@ -255,5 +294,5 @@ if __name__ == "__main__":
     if df_aggiornato is not None:
         df_scored = calcola_motori_quantitativi(df_aggiornato)
         df_portafoglio = crea_portafoglio_barbell(df_scored)
-        df_ordini = esegui_ordini_alpaca(df_portafoglio)
+        df_ordini = esegui_ordini_alpaca_delta(df_portafoglio)
         invia_email_report(df_ordini, df_portafoglio)
