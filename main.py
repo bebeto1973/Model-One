@@ -128,8 +128,12 @@ def esegui_ordini_alpaca(df_portafoglio):
         # --- ORDINI LONG ---
         for index, row in df_portafoglio.iterrows():
             ticker = row['Ticker'].replace('-', '.')
+            prezzo = float(row['Prezzo_Attuale'])
             peso_decimale = row['Peso (%)'] / 100
             importo_dollari = equity * peso_decimale
+            
+            # Calcolo esplicito delle quote frazionate
+            qty = round(importo_dollari / prezzo, 2) if prezzo > 0 else 0
             
             try:
                 req = MarketOrderRequest(
@@ -139,7 +143,13 @@ def esegui_ordini_alpaca(df_portafoglio):
                     time_in_force=TimeInForce.DAY
                 )
                 trading_client.submit_order(order_data=req)
-                ordini_eseguiti.append({'Ticker': ticker, 'Azione': 'BUY (Long)', 'Importo ($)': round(importo_dollari, 2)})
+                ordini_eseguiti.append({
+                    'Ticker': ticker,
+                    'Azione': 'BUY (Long)',
+                    'Prezzo ($)': round(prezzo, 2),
+                    'Quantità': qty,
+                    'Importo ($)': round(importo_dollari, 2)
+                })
             except Exception as e:
                 logger.warning(f"❌ Errore ordine {ticker}: {e}")
                 
@@ -150,16 +160,25 @@ def esegui_ordini_alpaca(df_portafoglio):
         prezzo_spy = float(trades_etf['SPY'].price)
         prezzo_qqq = float(trades_etf['QQQ'].price)
         
-        importo_short = equity * 0.50 # 50% short su ciascun indice
+        importo_short = equity * 0.50  # 50% short per ciascun ETF
         
         qty_spy = int(importo_short // prezzo_spy)
         qty_qqq = int(importo_short // prezzo_qqq)
+        
+        importo_spy = round(qty_spy * prezzo_spy, 2)
+        importo_qqq = round(qty_qqq * prezzo_qqq, 2)
         
         try:
             if qty_spy > 0:
                 req_spy = MarketOrderRequest(symbol='SPY', qty=qty_spy, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
                 trading_client.submit_order(order_data=req_spy)
-                ordini_eseguiti.append({'Ticker': 'SPY', 'Azione': 'SELL (Short)', 'Quantità': qty_spy})
+                ordini_eseguiti.append({
+                    'Ticker': 'SPY',
+                    'Azione': 'SELL (Short)',
+                    'Prezzo ($)': round(prezzo_spy, 2),
+                    'Quantità': qty_spy,
+                    'Importo ($)': importo_spy
+                })
         except Exception as e:
             logger.warning(f"❌ Errore ordine SPY: {e}")
             
@@ -167,7 +186,13 @@ def esegui_ordini_alpaca(df_portafoglio):
             if qty_qqq > 0:
                 req_qqq = MarketOrderRequest(symbol='QQQ', qty=qty_qqq, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
                 trading_client.submit_order(order_data=req_qqq)
-                ordini_eseguiti.append({'Ticker': 'QQQ', 'Azione': 'SELL (Short)', 'Quantità': qty_qqq})
+                ordini_eseguiti.append({
+                    'Ticker': 'QQQ',
+                    'Azione': 'SELL (Short)',
+                    'Prezzo ($)': round(prezzo_qqq, 2),
+                    'Quantità': qty_qqq,
+                    'Importo ($)': importo_qqq
+                })
         except Exception as e:
             logger.warning(f"❌ Errore ordine QQQ: {e}")
             
