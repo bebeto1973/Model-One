@@ -179,7 +179,7 @@ def esegui_ordini_alpaca(df_portafoglio):
 # ==========================================
 # 6. REPORT EMAIL
 # ==========================================
-def invia_email_report(df_ordini):
+def invia_email_report(df_ordini, df_portafoglio):
     if not SENDER_EMAIL or not SENDER_PASSWORD or not RECEIVER_EMAIL:
         logger.warning("❌ Credenziali Email mancanti, salto invio.")
         return
@@ -190,14 +190,34 @@ def invia_email_report(df_ordini):
         msg['To'] = RECEIVER_EMAIL
         msg['Subject'] = "📊 Report Barbell Quant - Esecuzione Completata"
         
+        # Prepara la tabella dei fondamentali per la Top 10
+        if df_portafoglio is not None and not df_portafoglio.empty:
+            colonne_utili = ['Ticker', 'Settore', 'Score', 'Rule of 40 (Proxy)', 'FCF Yield', 'Gross Margin (%)']
+            colonne_presenti = [c for c in colonne_utili if c in df_portafoglio.columns]
+            
+            df_fond = df_portafoglio[colonne_presenti].copy()
+            
+            # Formattazione per la mail (arrotondamenti e percentuali)
+            if 'Score' in df_fond: df_fond['Score'] = df_fond['Score'].round(2)
+            if 'Rule of 40 (Proxy)' in df_fond: df_fond['Rule of 40 (Proxy)'] = df_fond['Rule of 40 (Proxy)'].round(2).astype(str) + '%'
+            if 'FCF Yield' in df_fond: df_fond['FCF Yield'] = df_fond['FCF Yield'].round(2).astype(str) + '%'
+            if 'Gross Margin (%)' in df_fond: df_fond['Gross Margin (%)'] = df_fond['Gross Margin (%)'].round(2).astype(str) + '%'
+            
+            html_fondamentali = df_fond.to_html(index=False, border=1)
+        else:
+            html_fondamentali = "<p>Dati fondamentali non disponibili.</p>"
+        
         html = f"""
         <html>
-          <head></head>
           <body>
             <h2>Resoconto Rebalancing Barbell Quantitativo</h2>
             <p>Il bot ha aggiornato il database, calcolato gli score, liquidato le posizioni ed eseguito i nuovi ordini con successo.</p>
+            
             <h3>Ordini Inseriti a Mercato:</h3>
             {df_ordini.to_html(index=False, border=1) if df_ordini is not None and not df_ordini.empty else "<p>Nessun ordine eseguito.</p>"}
+            
+            <h3>Fondamentali Top 10 (Motivazioni di acquisto):</h3>
+            {html_fondamentali}
           </body>
         </html>
         """
@@ -212,6 +232,18 @@ def invia_email_report(df_ordini):
     except Exception as e:
         logger.warning(f"❌ Errore invio email: {e}")
 
+# ==========================================
+# PIPELINE PRINCIPALE
+# ==========================================
+if __name__ == "__main__":
+    df_aggiornato = aggiorna_database_fondamentali()
+    if df_aggiornato is not None:
+        df_scored = calcola_motori_quantitativi(df_aggiornato)
+        df_portafoglio = crea_portafoglio_barbell(df_scored)
+        df_ordini = esegui_ordini_alpaca(df_portafoglio)
+        # Passiamo anche df_portafoglio all'email
+        invia_email_report(df_ordini, df_portafoglio)
+        
 # ==========================================
 # PIPELINE PRINCIPALE
 # ==========================================
