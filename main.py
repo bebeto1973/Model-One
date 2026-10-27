@@ -43,7 +43,6 @@ def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xl
         
         for i in range(0, len(tickers), chunk_size):
             chunk_originali = tickers[i:i + chunk_size]
-            # Converte trattini in punti per Alpaca (es. BF-B -> BF.B)
             chunk_alpaca = [str(t).replace('-', '.') for t in chunk_originali]
             
             try:
@@ -51,7 +50,6 @@ def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xl
                 trades = data_client.get_stock_latest_trade(req)
                 
                 for ticker_alpaca, trade in trades.items():
-                    # Riconverte il punto in trattino per salvare nel database originale
                     ticker_orig = ticker_alpaca.replace('.', '-')
                     df.loc[df['Ticker'] == ticker_orig, 'Prezzo_Attuale'] = float(trade.price)
             except Exception as e:
@@ -69,10 +67,7 @@ def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xl
 # ==========================================
 def calcola_motori_quantitativi(df_master):
     logger.warning("⚙️ Calcolo Motori Quantitativi...")
-    # Usa l'ultimo dato disponibile per ogni Ticker
     df_live = df_master.sort_values(by=['Ticker', 'Data']).groupby('Ticker').tail(1).copy()
-    
-    # Filtro base di sicurezza
     df_live = df_live[df_live['Prezzo_Attuale'] > 0].copy()
     
     azioni = df_live.get('Azioni Medie Base', 1).replace(0, 1)
@@ -106,7 +101,7 @@ def crea_portafoglio_barbell(df_scored):
     logger.warning("⚖️ Creazione Asset Allocation Barbell...")
     df_long = df_scored.copy()
     df_long['Posizione'] = 'LONG'
-    df_long['Peso (%)'] = 10.0  # 10% per ciascuno dei 10 titoli long
+    df_long['Peso (%)'] = 10.0
     return df_long
 
 # ==========================================
@@ -132,7 +127,6 @@ def esegui_ordini_alpaca(df_portafoglio):
             peso_decimale = row['Peso (%)'] / 100
             importo_dollari = equity * peso_decimale
             
-            # Calcolo esplicito delle quote frazionate
             qty = round(importo_dollari / prezzo, 2) if prezzo > 0 else 0
             
             try:
@@ -160,13 +154,10 @@ def esegui_ordini_alpaca(df_portafoglio):
         prezzo_spy = float(trades_etf['SPY'].price)
         prezzo_qqq = float(trades_etf['QQQ'].price)
         
-        importo_short = equity * 0.50  # 50% short per ciascun ETF
+        importo_short = equity * 0.50
         
         qty_spy = int(importo_short // prezzo_spy)
         qty_qqq = int(importo_short // prezzo_qqq)
-        
-        importo_spy = round(qty_spy * prezzo_spy, 2)
-        importo_qqq = round(qty_qqq * prezzo_qqq, 2)
         
         try:
             if qty_spy > 0:
@@ -177,7 +168,7 @@ def esegui_ordini_alpaca(df_portafoglio):
                     'Azione': 'SELL (Short)',
                     'Prezzo ($)': round(prezzo_spy, 2),
                     'Quantità': qty_spy,
-                    'Importo ($)': importo_spy
+                    'Importo ($)': round(qty_spy * prezzo_spy, 2)
                 })
         except Exception as e:
             logger.warning(f"❌ Errore ordine SPY: {e}")
@@ -191,12 +182,13 @@ def esegui_ordini_alpaca(df_portafoglio):
                     'Azione': 'SELL (Short)',
                     'Prezzo ($)': round(prezzo_qqq, 2),
                     'Quantità': qty_qqq,
-                    'Importo ($)': importo_qqq
+                    'Importo ($)': round(qty_qqq * prezzo_qqq, 2)
                 })
         except Exception as e:
             logger.warning(f"❌ Errore ordine QQQ: {e}")
             
-        return pd.DataFrame(ordini_eseguiti)
+        # Sostituisce eventuali valori nulli con un trattino
+        return pd.DataFrame(ordini_eseguiti).fillna('-')
     except Exception as e:
         logger.warning(f"❌ Errore generale in esecuzione ordini: {e}")
         return None
@@ -215,14 +207,12 @@ def invia_email_report(df_ordini, df_portafoglio):
         msg['To'] = RECEIVER_EMAIL
         msg['Subject'] = "📊 Report Barbell Quant - Esecuzione Completata"
         
-        # Prepara la tabella dei fondamentali per la Top 10
         if df_portafoglio is not None and not df_portafoglio.empty:
             colonne_utili = ['Ticker', 'Settore', 'Score', 'Rule of 40 (Proxy)', 'FCF Yield', 'Gross Margin (%)']
             colonne_presenti = [c for c in colonne_utili if c in df_portafoglio.columns]
             
             df_fond = df_portafoglio[colonne_presenti].copy()
             
-            # Formattazione per la mail (arrotondamenti e percentuali)
             if 'Score' in df_fond: df_fond['Score'] = df_fond['Score'].round(2)
             if 'Rule of 40 (Proxy)' in df_fond: df_fond['Rule of 40 (Proxy)'] = df_fond['Rule of 40 (Proxy)'].round(2).astype(str) + '%'
             if 'FCF Yield' in df_fond: df_fond['FCF Yield'] = df_fond['FCF Yield'].round(2).astype(str) + '%'
@@ -266,8 +256,4 @@ if __name__ == "__main__":
         df_scored = calcola_motori_quantitativi(df_aggiornato)
         df_portafoglio = crea_portafoglio_barbell(df_scored)
         df_ordini = esegui_ordini_alpaca(df_portafoglio)
-        # Passiamo ENTRAMBI i dataframe per avere anche i fondamentali nella mail
         invia_email_report(df_ordini, df_portafoglio)
-        df_portafoglio = crea_portafoglio_barbell(df_scored)
-        df_ordini = esegui_ordini_alpaca(df_portafoglio)
-        invia_email_report(df_ordini)
