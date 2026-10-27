@@ -266,16 +266,8 @@ if __name__ == "__main__":
         df_scored = calcola_motori_quantitativi(df_aggiornato)
         df_portafoglio = crea_portafoglio_barbell(df_scored)
         df_ordini = esegui_ordini_alpaca(df_portafoglio)
-        # Passiamo anche df_portafoglio all'email
+        # Passiamo ENTRAMBI i dataframe per avere anche i fondamentali nella mail
         invia_email_report(df_ordini, df_portafoglio)
-        
-# ==========================================
-# PIPELINE PRINCIPALE
-# ==========================================
-if __name__ == "__main__":
-    df_aggiornato = aggiorna_database_fondamentali()
-    if df_aggiornato is not None:
-        df_scored = calcola_motori_quantitativi(df_aggiornato)
         df_portafoglio = crea_portafoglio_barbell(df_scored)
         df_ordini = esegui_ordini_alpaca(df_portafoglio)
         invia_email_report(df_ordini)
