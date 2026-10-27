@@ -1,69 +1,61 @@
 import os
-import time
 import logging
 import smtplib
-import ssl
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from dotenv import load_dotenv
+import pandas as pd
+import numpy as np
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-
-# ==========================================
-# 1. CONFIGURAZIONE E CREDENZIALI
-# ==========================================
-load_dotenv()
-
-API_KEY = os.environ.get('ALPACA_API_KEY_MODEL_ONE')
-API_SECRET = os.environ.get('ALPACA_SECRET_KEY_MODEL_ONE')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
-SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD') 
-RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
-
-log_format = '%(asctime)s - %(levelname)s - %(message)s'
-logging.basicConfig(level=logging.WARNING, format=log_format,
-                    handlers=[logging.FileHandler("barbell_bot.log", encoding='utf-8'), logging.StreamHandler()])
-logger = logging.getLogger()
-
-# ==========================================
-# 2. MODULO AGGIORNAMENTO DATABASE (Via Alpaca)
-# ==========================================
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Credenziali da GitHub Secrets
+API_KEY = os.environ.get('ALPACA_API_KEY_MODEL_ONE')
+API_SECRET = os.environ.get('ALPACA_SECRET_KEY_MODEL_ONE')
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
+RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
+
+# Inizializzazione Client Alpaca
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+# ==========================================
+# 1. & 2. AGGIORNAMENTO PREZZI VIA ALPACA
+# ==========================================
 def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xlsx'):
     logger.warning("🔄 Avvio aggiornamento Database tramite Alpaca...")
     try:
         df = pd.read_excel(filepath)
-        tickers = df['Ticker'].unique().tolist()
         
-        # Prevenzione errore: creiamo la colonna a zero per sicurezza
         if 'Prezzo_Attuale' not in df.columns:
             df['Prezzo_Attuale'] = 0.0
 
-        # Inizializza il client dati di Alpaca usando le tue chiavi esistenti
-        data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-        
-        # Alpaca gestisce benissimo le richieste, ma dividiamo i 500 ticker in piccoli blocchi 
-        # per evitare timeout di rete
+        tickers = df['Ticker'].unique().tolist()
         chunk_size = 100
+        
         for i in range(0, len(tickers), chunk_size):
-            # Converte i trattini in punti per i ticker di classi speciali (es. BRK-B -> BRK.B)
-            chunk = [t.replace('-', '.') for t in tickers[i:i + chunk_size]]
+            chunk_originali = tickers[i:i + chunk_size]
+            # Converte trattini in punti per Alpaca (es. BF-B -> BF.B)
+            chunk_alpaca = [str(t).replace('-', '.') for t in chunk_originali]
+            
             try:
-                req = StockLatestTradeRequest(symbol_or_symbols=chunk)
+                req = StockLatestTradeRequest(symbol_or_symbols=chunk_alpaca)
                 trades = data_client.get_stock_latest_trade(req)
                 
-                for ticker, trade in trades.items():
-                    df.loc[df['Ticker'] == ticker, 'Prezzo_Attuale'] = float(trade.price)
+                for ticker_alpaca, trade in trades.items():
+                    # Riconverte il punto in trattino per salvare nel database originale
+                    ticker_orig = ticker_alpaca.replace('.', '-')
+                    df.loc[df['Ticker'] == ticker_orig, 'Prezzo_Attuale'] = float(trade.price)
             except Exception as e:
-                logger.warning(f"⚠️ Errore download Alpaca per il blocco {chunk[0]}... : {e}")
+                logger.warning(f"⚠️ Errore download Alpaca per il blocco: {e}")
         
         df.to_excel(filepath, index=False)
         logger.warning(f"✅ Database aggiornato con gli ultimi prezzi per {len(tickers)} ticker.")
@@ -77,151 +69,156 @@ def aggiorna_database_fondamentali(filepath='Database_Quantitativo_Definitivo.xl
 # ==========================================
 def calcola_motori_quantitativi(df_master):
     logger.warning("⚙️ Calcolo Motori Quantitativi...")
-    data_limite = pd.Timestamp('today') - pd.DateOffset(months=6)
-    
-    # Raggruppamento per prendere solo l'ultimo dato disponibile per ogni Ticker
+    # Usa l'ultimo dato disponibile per ogni Ticker
     df_live = df_master.sort_values(by=['Ticker', 'Data']).groupby('Ticker').tail(1).copy()
-    df_live['filingDate'] = pd.to_datetime(df_live.get('filingDate', df_live['Data']))
-    df_live = df_live[df_live['filingDate'] >= data_limite]
-
-    # Sicurezza: evito divisioni per zero
-    azioni = df_live['Azioni Medie Base'].replace(0, np.nan)
-    ricavi = df_live['Ricavi Totali (Discreto)'].replace(0, np.nan)
+    
+    # Filtro base di sicurezza
+    df_live = df_live[df_live['Prezzo_Attuale'] > 0].copy()
+    
+    azioni = df_live.get('Azioni Medie Base', 1).replace(0, 1)
+    ricavi = df_live.get('Ricavi Totali (Discreto)', 1).replace(0, 1)
     market_cap = df_live['Prezzo_Attuale'] * azioni
     
-    risultati = []
-
-    # -- TECH (Rule of 40 & Gross Margin) --
+    sbc = df_live.get('Stock-Based Compensation (SBC) (Discreto)', 0).fillna(0)
+    fcf = df_live.get('Free Cash Flow YTD (Discreto)', 0).fillna(0)
+    fcf_rett = fcf - sbc
+    
+    df_live['Rule of 40 (Proxy)'] = df_live.get('Crescita YoY (%)', 0) + ((fcf_rett / ricavi) * 100)
+    df_live['FCF Yield'] = (fcf / market_cap) * 100
+    df_live['Gross Margin (%)'] = (df_live.get('Utile Lordo (Discreto)', 0) / ricavi) * 100
+    
+    # --- MOTORE TECH ---
     tech = df_live[df_live['Settore'] == 'Information Technology'].copy()
-    if not tech.empty:
-        sbc = tech.get('Stock-Based Compensation (SBC) (Discreto)', 0).fillna(0)
-        fcf_rett = tech['Free Cash Flow YTD (Discreto)'] - sbc
-        tech['Rule of 40'] = tech.get('Crescita YoY (%)', 0) + ((fcf_rett / ricavi) * 100)
-        tech['Gross Margin (%)'] = (tech.get('Utile Lordo (Discreto)', 0) / ricavi) * 100
-        tech = tech.dropna(subset=['Rule of 40'])
-        tech['Score'] = ((tech['Rule of 40'].rank(pct=True) * 0.7) + (tech['Gross Margin (%)'].rank(pct=True) * 0.3)) * 100
-        tech['Motore'] = 'Tech'
-        risultati.append(tech)
-
-    # -- DEFENSIVES (Banks, Ind, Util) --
-    # Semplificato per spazio: applichiamo logiche simili mappando i settori
-    defensives = df_live[~df_live['Settore'].isin(['Information Technology'])].copy()
-    if not defensives.empty:
-        # Usiamo un proxy generale per i difensivi basato su FCF Yield e ROE
-        defensives['FCF Yield'] = (defensives['Free Cash Flow YTD (Discreto)'] / market_cap) * 100
-        defensives['ROE'] = (defensives['Utile Netto (Discreto)'] / defensives['Patrimonio Netto'].replace(0, np.nan)) * 100
-        defensives = defensives.dropna(subset=['FCF Yield', 'ROE'])
-        defensives['Score'] = ((defensives['FCF Yield'].rank(pct=True) * 0.5) + (defensives['ROE'].rank(pct=True) * 0.5)) * 100
-        defensives['Motore'] = 'Defensive'
-        risultati.append(defensives)
-
-    df_full = pd.concat(risultati, ignore_index=True)
-    return df_full
+    tech['Score'] = (tech['Rule of 40 (Proxy)'].rank(pct=True) * 0.70) + (tech['Gross Margin (%)'].rank(pct=True) * 0.30)
+    tech = tech.dropna(subset=['Score']).sort_values(by='Score', ascending=False).head(5)
+    
+    # --- MOTORE DIFENSIVO ---
+    difensivi = df_live[df_live['Settore'] != 'Information Technology'].copy()
+    difensivi['Score'] = (difensivi['FCF Yield'].rank(pct=True) * 0.60) + (difensivi['Gross Margin (%)'].rank(pct=True) * 0.40)
+    difensivi = difensivi.dropna(subset=['Score']).sort_values(by='Score', ascending=False).head(5)
+    
+    return pd.concat([tech, difensivi])
 
 # ==========================================
 # 4. ALLOCATORE BARBELL (LONG/SHORT)
 # ==========================================
 def crea_portafoglio_barbell(df_scored):
     logger.warning("⚖️ Creazione Asset Allocation Barbell...")
-    
-    df_tech = df_scored[df_scored['Motore'] == 'Tech'].sort_values(by='Score', ascending=False).head(5)
-    df_def = df_scored[df_scored['Motore'] == 'Defensive'].sort_values(by='Score', ascending=False).head(5)
-    
-    # Gamba LONG (10% cad)
-    df_long = pd.concat([df_tech, df_def]).reset_index(drop=True)
+    df_long = df_scored.copy()
     df_long['Posizione'] = 'LONG'
-    df_long['Peso (%)'] = 10.0
-    
-    # Gamba SHORT (Hedge -50% cad)
-    hedge_data = [
-        {'Ticker': 'QQQ', 'Motore': 'Hedge', 'Posizione': 'SHORT', 'Score': 0, 'Peso (%)': 50.0},
-        {'Ticker': 'SPY', 'Motore': 'Hedge', 'Posizione': 'SHORT', 'Score': 0, 'Peso (%)': 50.0}
-    ]
-    df_short = pd.DataFrame(hedge_data)
-    
-    df_portfolio = pd.concat([df_long, df_short], ignore_index=True)[['Ticker', 'Motore', 'Posizione', 'Score', 'Peso (%)']]
-    return df_portfolio
+    df_long['Peso (%)'] = 10.0  # 10% per ciascuno dei 10 titoli long
+    return df_long
 
 # ==========================================
-# 5. ESECUZIONE ALPACA (LIQUIDATE & REINVEST)
+# 5. ESECUZIONE ORDINI SU ALPACA
 # ==========================================
-def esegui_su_alpaca(df_portfolio):
+def esegui_ordini_alpaca(df_portafoglio):
     logger.warning("🤖 Connessione ad Alpaca in corso...")
-    client = TradingClient(API_KEY, API_SECRET, paper=True)
-    
-    logger.warning("🧹 Chiusura ordini e posizioni precedenti...")
-    client.cancel_orders()
-    client.close_all_positions(cancel_orders=True)
-    time.sleep(8) 
-    
-    account = client.get_account()
-    equity = float(account.equity)
-    logger.warning(f"💰 Equity Disponibile: ${equity:,.2f}")
-    
-    html_ordini = []
-    
-    for _, row in df_portfolio.iterrows():
-        ticker, pos, peso = row['Ticker'], row['Posizione'], row['Peso (%)']
-        importo_dollari = (peso / 100) * equity
+    try:
+        logger.warning("🧹 Chiusura ordini e posizioni precedenti...")
+        trading_client.cancel_orders()
+        trading_client.close_all_positions(cancel_orders=True)
+        
+        account = trading_client.get_account()
+        equity = float(account.equity)
+        logger.warning(f"💰 Equity Disponibile: ${equity:,.2f}")
+        
+        ordini_eseguiti = []
+        
+        # --- ORDINI LONG ---
+        for index, row in df_portafoglio.iterrows():
+            ticker = row['Ticker'].replace('-', '.')
+            peso_decimale = row['Peso (%)'] / 100
+            importo_dollari = equity * peso_decimale
+            
+            try:
+                req = MarketOrderRequest(
+                    symbol=ticker,
+                    notional=round(importo_dollari, 2),
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(order_data=req)
+                ordini_eseguiti.append({'Ticker': ticker, 'Azione': 'BUY (Long)', 'Importo ($)': round(importo_dollari, 2)})
+            except Exception as e:
+                logger.warning(f"❌ Errore ordine {ticker}: {e}")
+                
+        # --- ORDINI SHORT (SPY e QQQ) ---
+        req_etf = StockLatestTradeRequest(symbol_or_symbols=['SPY', 'QQQ'])
+        trades_etf = data_client.get_stock_latest_trade(req_etf)
+        
+        prezzo_spy = float(trades_etf['SPY'].price)
+        prezzo_qqq = float(trades_etf['QQQ'].price)
+        
+        importo_short = equity * 0.50 # 50% short su ciascun indice
+        
+        qty_spy = int(importo_short // prezzo_spy)
+        qty_qqq = int(importo_short // prezzo_qqq)
         
         try:
-            if pos == 'LONG':
-                order = MarketOrderRequest(symbol=ticker, notional=round(importo_dollari, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-                client.submit_order(order)
-                html_ordini.append(f"<li>🟢 <b>LONG {ticker}</b>: ${importo_dollari:,.2f}</li>")
-            elif pos == 'SHORT':
-                prezzo = float(client.get_latest_trade(ticker).price)
-                quote_intere = int(importo_dollari // prezzo)
-                if quote_intere > 0:
-                    order = MarketOrderRequest(symbol=ticker, qty=quote_intere, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-                    client.submit_order(order)
-                    html_ordini.append(f"<li>🔴 <b>SHORT {ticker}</b>: {quote_intere} quote (~${quote_intere*prezzo:,.2f})</li>")
+            if qty_spy > 0:
+                req_spy = MarketOrderRequest(symbol='SPY', qty=qty_spy, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+                trading_client.submit_order(order_data=req_spy)
+                ordini_eseguiti.append({'Ticker': 'SPY', 'Azione': 'SELL (Short)', 'Quantità': qty_spy})
         except Exception as e:
-            logger.warning(f"❌ Errore ordine {ticker}: {e}")
+            logger.warning(f"❌ Errore ordine SPY: {e}")
             
-    return equity, float(account.last_equity), html_ordini
-
-# ==========================================
-# 6. REPORTISTICA EMAIL
-# ==========================================
-def invia_report(equity_oggi, equity_ieri, ordini_html):
-    if not SENDER_EMAIL: return
-    pnl_usd = equity_oggi - equity_ieri
-    pnl_pct = (pnl_usd / equity_ieri) * 100 if equity_ieri > 0 else 0
-    colore = "#27ae60" if pnl_usd >= 0 else "#c0392b"
-    
-    body = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif; color: #333;">
-        <h2 style="background-color: #2c3e50; color: white; padding: 10px;">📊 Barbell Quant Fund - Daily Report</h2>
-        <h3>Stato Conto Alpaca (1M Model)</h3>
-        <p><b>Equity Totale:</b> ${equity_oggi:,.2f}</p>
-        <p><b>PnL Odierno:</b> <span style="color: {colore}; font-weight: bold;">${pnl_usd:,.2f} ({pnl_pct:+.2f}%)</span></p>
-        <hr>
-        <h3>Esecuzione Allocazione (Liquidate & Reinvest)</h3>
-        <ul>{''.join(ordini_html)}</ul>
-    </body>
-    </html>
-    """
-    msg = MIMEMultipart()
-    msg['From'], msg['To'], msg['Subject'] = SENDER_EMAIL, RECEIVER_EMAIL, f"Report Barbell - PnL: {pnl_pct:+.2f}%"
-    msg.attach(MIMEText(body, 'html', 'utf-8'))
-    
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
-            s.login(SENDER_EMAIL, SENDER_PASSWORD)
-            s.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-        logger.warning("📧 Report email inviato.")
+        try:
+            if qty_qqq > 0:
+                req_qqq = MarketOrderRequest(symbol='QQQ', qty=qty_qqq, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+                trading_client.submit_order(order_data=req_qqq)
+                ordini_eseguiti.append({'Ticker': 'QQQ', 'Azione': 'SELL (Short)', 'Quantità': qty_qqq})
+        except Exception as e:
+            logger.warning(f"❌ Errore ordine QQQ: {e}")
+            
+        return pd.DataFrame(ordini_eseguiti)
     except Exception as e:
-        logger.warning(f"❌ Errore Email: {e}")
+        logger.warning(f"❌ Errore generale in esecuzione ordini: {e}")
+        return None
 
 # ==========================================
-# MAIN EXECUTION
+# 6. REPORT EMAIL
+# ==========================================
+def invia_email_report(df_ordini):
+    if not SENDER_EMAIL or not SENDER_PASSWORD or not RECEIVER_EMAIL:
+        logger.warning("❌ Credenziali Email mancanti, salto invio.")
+        return
+        
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = "📊 Report Barbell Quant - Esecuzione Completata"
+        
+        html = f"""
+        <html>
+          <head></head>
+          <body>
+            <h2>Resoconto Rebalancing Barbell Quantitativo</h2>
+            <p>Il bot ha aggiornato il database, calcolato gli score, liquidato le posizioni ed eseguito i nuovi ordini con successo.</p>
+            <h3>Ordini Inseriti a Mercato:</h3>
+            {df_ordini.to_html(index=False, border=1) if df_ordini is not None and not df_ordini.empty else "<p>Nessun ordine eseguito.</p>"}
+          </body>
+        </html>
+        """
+        msg.attach(MIMEText(html, 'html'))
+        
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        logger.warning("📧 Report email inviato con successo.")
+    except Exception as e:
+        logger.warning(f"❌ Errore invio email: {e}")
+
+# ==========================================
+# PIPELINE PRINCIPALE
 # ==========================================
 if __name__ == "__main__":
     df_aggiornato = aggiorna_database_fondamentali()
     if df_aggiornato is not None:
         df_scored = calcola_motori_quantitativi(df_aggiornato)
         df_portafoglio = crea_portafoglio_barbell(df_scored)
-        eq_oggi, eq_ieri, ordini = esegui_su_alpaca(df_portafoglio)
-        invia_report(eq_oggi, eq_ieri, ordini)
+        df_ordini = esegui_ordini_alpaca(df_portafoglio)
+        invia_email_report(df_ordini)
