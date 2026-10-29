@@ -2,14 +2,16 @@ name: Barbell Quant Daily Workflow
 
 on:
   schedule:
-    # Esempio: tutti i giorni feriali alle 14:00 UTC (prima dell'apertura dei mercati USA)
+    # Tutti i giorni feriali alle 14:00 UTC (prima dell'apertura dei mercati USA)
     - cron: '0 14 * * 1-5'
   workflow_dispatch: # Permette di lanciarlo anche a mano col pulsante "Run workflow"
 
 jobs:
   trading-bot:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write  # Fondamentale per permettere ad Actions di fare il "git push" finale
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,7 +23,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas numpy alpaca-trade-api yfinance openpyxl requests
+          python -m pip install --upgrade pip
+          # SOSTITUITO 'alpaca-trade-api' CON 'alpaca-py'
+          pip install pandas numpy alpaca-py yfinance openpyxl requests
 
       - name: 1. Download Fondamentali SEC
         run: python aggiorna_fondamentali.py
