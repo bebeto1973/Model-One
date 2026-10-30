@@ -25,7 +25,7 @@ if data_partenza <= oggi:
     nuovi_dati = yf.download(tickers_list, start=data_partenza.strftime('%Y-%m-%d'), end=oggi.strftime('%Y-%m-%d'))
     
     # 3. ACCODAMENTO AL DATABASE (APPEND)
-    if non nuovi_dati.empty:
+    if not nuovi_dati.empty:
         # Formattazione...
         df_nuovi_prezzi.to_sql('raw_prezzi_giornalieri', conn, if_exists='append', index=False)
         print("✅ Nuovi prezzi accodati con successo.")
