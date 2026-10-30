@@ -1,0 +1,55 @@
+name: Alpaca Market-Neutral Bot
+
+on:
+  schedule:
+    # Esegue ogni giorno alle 23:00 UTC (dal lunedì al venerdì)
+    - cron: '0 23 * * 1-5'
+  workflow_dispatch: # Permette l'avvio manuale dal pannello "Actions" su GitHub
+
+jobs:
+  quant-trading:
+    runs-on: ubuntu-latest
+    
+    # PERMESSO CRITICO: Consente a GitHub Actions di salvare i file modificati nel repository
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout del repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # Velocizza le esecuzioni successive memorizzando le librerie
+
+      - name: Installa le dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 1. Esegui il Motore Quantitativo (Aggiornamento DB & Machine Learning)
+        run: python motore_quant.py
+
+      - name: 2. Esegui il Bot Esecutivo (Rebalancing Alpaca)
+        env:
+          ALPACA_API_KEY_MODEL_ONE: ${{ secrets.ALPACA_API_KEY_MODEL_ONE }}
+          ALPACA_SECRET_KEY_MODEL_ONE: ${{ secrets.ALPACA_SECRET_KEY_MODEL_ONE }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python main.py
+
+      - name: 3. Salva i Database Aggiornati (Auto-Commit)
+        run: |
+          git config --global user.name "Quant Bot Action"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Mette nel carrello i file dati generati o modificati dallo script
+          git add sp500_bilanci_quarterly.db
+          git add Database_Quantitativo_Aggiornato.xlsx
+          git add Top_15_Live.xlsx
+          
+          # Esegue il commit solo se ci sono state modifiche effettive, evitando errori se i dati sono identici
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Aggiornamento incrementale DB e Top 15 📈" && git push)
