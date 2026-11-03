@@ -197,6 +197,16 @@ df['Score_Finale'] = df.apply(applica_hard_filters, axis=1)
 data_limite = df['Data_Valutazione'].max() - timedelta(days=90)
 df_live = df[(df['Data_Valutazione'] >= data_limite) & (df['Score_Finale'] >= 60)].copy()
 
+# ==========================================
+# I DUE SCUDI ANTI-FANTASMA E ANTI-CLONI
+# ==========================================
+# 1. Uccide i fantasmi: tieni solo i ticker che fanno ORA parte dell'S&P 500
+df_live = df_live[df_live['Ticker'].isin(tickers_list)]
+
+# 2. Uccide i cloni: se un'azienda ha più report recenti, tieni solo l'ultimo
+df_live = df_live.drop_duplicates(subset=['Ticker'], keep='first')
+# ==========================================
+
 df_live['FCF_Yield_%'] = (df_live.get('Free Cash Flow YTD (Discreto)', 0) * 4 / df_live.get('Market Cap', 1)) * 100
 top_15 = df_live.sort_values(by=['Score_Dinamico_100', 'FCF_Yield_%'], ascending=[False, False]).head(15)
 
