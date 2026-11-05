@@ -30,52 +30,37 @@ def calcola_statistiche_performance():
     logger.info("📊 Calcolo metriche di performance da Alpaca...")
     try:
         account = trading_client.get_account()
-        equity_attuale = float(account.equity)
-        equity_ieri = float(account.last_equity)
+        
+        # Recupero sicuro dei valori base, con fallback a 0.0
+        equity_attuale = float(account.equity) if account.equity else 0.0
+        equity_ieri = float(account.last_equity) if account.last_equity else equity_attuale
+        cash_iniziale = float(account.initial_margin) if getattr(account, 'initial_margin', None) else 100000.0 # Standard paper start
         
         # PnL Giornaliero Base
-        daily_pnl_perc = ((equity_attuale - equity_ieri) / equity_ieri) * 100 if equity_ieri > 0 else 0
+        daily_pnl_perc = ((equity_attuale - equity_ieri) / equity_ieri) * 100 if equity_ieri > 0 else 0.0
         
-        # Storico per Inception e Drawdown (Ultimo Anno)
-        req_hist = GetPortfolioHistoryRequest(period="1A", timeframe="1D")
-        hist = trading_client.get_portfolio_history(req_hist)
+        # PnL Storico Assoluto (Da inizio Paper Trading)
+        inception_pnl_perc = ((equity_attuale - cash_iniziale) / cash_iniziale) * 100 if cash_iniziale > 0 else 0.0
         
-        # Filtra eventuali valori nulli restituiti dall'API nei weekend
-        equity_curve = [e for e in hist.equity if e is not None]
-        
-        if len(equity_curve) > 1:
-            equity_iniziale = equity_curve[0]
-            
-            # PnL Since Inception (o da inizio tracciamento YTD)
-            inception_pnl_perc = ((equity_attuale - equity_iniziale) / equity_iniziale) * 100
-            
-            # Calcolo PnL Mensile MTD (Ultimi 21 giorni di borsa, circa 1 mese)
-            giorni_mese = min(21, len(equity_curve)-1)
-            equity_mese_fa = equity_curve[-giorni_mese]
-            mensile_pnl_perc = ((equity_attuale - equity_mese_fa) / equity_mese_fa) * 100
-            
-            # Calcolo Max Drawdown Reale
-            rolling_max = np.maximum.accumulate(equity_curve)
-            drawdowns = (np.array(equity_curve) - rolling_max) / rolling_max
-            max_drawdown = np.min(drawdowns) * 100
+        # Calcolo Drawdown Reale basato sull'high water mark
+        hwm = float(account.highest_equity) if getattr(account, 'highest_equity', None) else equity_attuale
+        if hwm > 0:
+            max_drawdown = ((equity_attuale - hwm) / hwm) * 100
         else:
-            inception_pnl_perc = 0.0
-            mensile_pnl_perc = 0.0
             max_drawdown = 0.0
 
         stats = {
-            "Metrica": ["Equity Attuale", "PnL Giornaliero", "PnL Mensile (MTD)", "PnL Since Inception", "Max Drawdown"],
+            "Metrica": ["Equity Attuale", "PnL Giornaliero", "PnL Complessivo", "Drawdown Attuale"],
             "Valore": [
                 f"${equity_attuale:,.2f}", 
                 f"{daily_pnl_perc:+.2f}%", 
-                f"{mensile_pnl_perc:+.2f}%", 
                 f"{inception_pnl_perc:+.2f}%", 
                 f"{max_drawdown:.2f}%"
             ]
         }
         return pd.DataFrame(stats)
     except Exception as e:
-        logger.warning(f"⚠️ Errore nel calcolo performance: {e}")
+        logger.warning(f"⚠️ Errore nel calcolo performance base: {e}")
         return None
 
 def esegui_rebalancing_market_neutral():
