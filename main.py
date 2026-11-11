@@ -17,12 +17,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Credenziali
-API_KEY = os.environ.get('ALPACA_API_KEY_MODEL_ONE')
-API_SECRET = os.environ.get('ALPACA_SECRET_KEY_MODEL_ONE')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
-SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
-RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
+API_KEY = os.environ.get('ALPACA_API_KEY_MODEL_ONE', '').strip().replace('"', '').replace("'", "")
+API_SECRET = os.environ.get('ALPACA_SECRET_KEY_MODEL_ONE', '').strip().replace('"', '').replace("'", "")
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', '').strip().replace('"', '').replace("'", "")
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', '').strip().replace('"', '').replace("'", "")
+RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL', '').strip().replace('"', '').replace("'", "")
 
+if len(API_KEY) == 0:
+    logger.error("ERRORE: API Key mancante nei Secrets.")
+    
 trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
@@ -31,23 +34,15 @@ def calcola_statistiche_performance():
     try:
         account = trading_client.get_account()
         
-        # Recupero sicuro dei valori base, con fallback a 0.0
         equity_attuale = float(account.equity) if account.equity else 0.0
         equity_ieri = float(account.last_equity) if account.last_equity else equity_attuale
-        cash_iniziale = float(account.initial_margin) if getattr(account, 'initial_margin', None) else 100000.0 # Standard paper start
+        cash_iniziale = float(account.initial_margin) if getattr(account, 'initial_margin', None) else 100000.0 
         
-        # PnL Giornaliero Base
         daily_pnl_perc = ((equity_attuale - equity_ieri) / equity_ieri) * 100 if equity_ieri > 0 else 0.0
-        
-        # PnL Storico Assoluto (Da inizio Paper Trading)
         inception_pnl_perc = ((equity_attuale - cash_iniziale) / cash_iniziale) * 100 if cash_iniziale > 0 else 0.0
         
-        # Calcolo Drawdown Reale basato sull'high water mark
         hwm = float(account.highest_equity) if getattr(account, 'highest_equity', None) else equity_attuale
-        if hwm > 0:
-            max_drawdown = ((equity_attuale - hwm) / hwm) * 100
-        else:
-            max_drawdown = 0.0
+        max_drawdown = ((equity_attuale - hwm) / hwm) * 100 if hwm > 0 else 0.0
 
         stats = {
             "Metrica": ["Equity Attuale", "PnL Giornaliero", "PnL Complessivo", "Drawdown Attuale"],
@@ -60,7 +55,7 @@ def calcola_statistiche_performance():
         }
         return pd.DataFrame(stats)
     except Exception as e:
-        logger.warning(f"⚠️ Errore nel calcolo performance base: {e}")
+        logger.warning(f"⚠️ Errore calcolo performance: {e}")
         return None
 
 def esegui_rebalancing_market_neutral():
@@ -73,15 +68,18 @@ def esegui_rebalancing_market_neutral():
             return None, None
             
         df_top15 = pd.read_excel('Top_15_Live.xlsx')
-        tickers_alpaca = [str(t).replace('-', '.') for t in df_top15['Ticker'].tolist()]
+        tickers_alpaca = [str(t).replace('-', '.') for t in df_top15['Ticker'].tolist()] if not df_top15.empty else []
         
+        # BUG RISOLTO: Rimosso il return None che spegneva il bot in Cash Mode.
         if len(tickers_alpaca) == 0:
-            return None, None
+            logger.warning("⚠️ Modalità CASH (100% Liquido). Smontaggio portafoglio in corso.")
         
         account = trading_client.get_account()
         equity = float(account.equity)
-        target_importo_long_singolo = equity / len(tickers_alpaca)
-        target_importo_short_spy = equity * 1.0 
+        
+        # Se 0 titoli, target 0 per tutti e 0% di Hedge (Market Neutral = No Long, No Short)
+        target_importo_long_singolo = (equity / len(tickers_alpaca)) if len(tickers_alpaca) > 0 else 0.0
+        target_importo_short_spy = equity * 1.0 if len(tickers_alpaca) > 0 else 0.0 
         
         tutti_i_ticker = tickers_alpaca + ['SPY']
         prezzi_live = {}
@@ -100,13 +98,18 @@ def esegui_rebalancing_market_neutral():
                 
         posizioni_esistenti = {p.symbol: {'qty': float(p.qty), 'market_value': float(p.market_value)} for p in trading_client.get_all_positions()}
             
-        # CHIUSURA DISMESSE
+        # 1. CHIUSURA DISMESSE (o CHIUSURA TOTALE se in Cash Mode)
         for symbol in list(posizioni_esistenti.keys()):
             if symbol not in tickers_alpaca and symbol != 'SPY':
-                try: trading_client.close_position(symbol)
+                try: 
+                    trading_client.close_position(symbol)
+                    ordini_eseguiti.append({
+                        'Ticker': symbol, 'Gamba': 'LONG', 'Azione': 'SELL (Uscita)',
+                        'Prezzo ($)': 0, 'Q.tà Delta': 0, 'Controvalore ($)': 0
+                    })
                 except: pass
 
-        # ESECUZIONE LONG
+        # 2. ESECUZIONE LONG (Saltato in Cash Mode)
         for ticker in tickers_alpaca:
             prezzo = prezzi_live.get(ticker, 0)
             if prezzo <= 0: continue
@@ -134,7 +137,7 @@ def esegui_rebalancing_market_neutral():
                     'Prezzo ($)': round(prezzo, 2), 'Q.tà Delta': 0, 'Controvalore ($)': 0
                 })
 
-        # ESECUZIONE SHORT SPY
+        # 3. ESECUZIONE SHORT SPY (Azzerato in Cash Mode)
         prezzo_spy = prezzi_live.get('SPY', 0)
         if prezzo_spy > 0:
             target_qty_spy = int(target_importo_short_spy / prezzo_spy)
@@ -173,13 +176,13 @@ def invia_email_esecutiva(df_ordini, df_top15, df_stats):
         msg['Subject'] = "📈 Report Quantitativo: Esecuzione e Performance"
         
         html_stats = df_stats.to_html(index=False, border=1) if df_stats is not None else "<p>Dati performance non disponibili.</p>"
-        html_ordini = df_ordini.to_html(index=False, border=1) if df_ordini is not None and not df_ordini.empty else "<p>Nessun movimento.</p>"
+        html_ordini = df_ordini.to_html(index=False, border=1) if df_ordini is not None and not df_ordini.empty else "<p>Nessun movimento necessario (Cash Mode attivo senza esposizioni residue).</p>"
         
-        if df_top15 is not None:
-            col_utili = [c for c in ['Ticker', 'Settore', 'Score_Dinamico_100', 'FCF_Yield_%', 'Rendimento_da_Report_%'] if c in df_top15.columns]
+        if df_top15 is not None and not df_top15.empty:
+            col_utili = [c for c in ['Ticker', 'Settore', 'Score_Dinamico_100', 'FCF_Yield_%', 'Prezzo'] if c in df_top15.columns]
             html_top15 = df_top15[col_utili].round(2).to_html(index=False, border=1)
         else:
-            html_top15 = "<p>N/A</p>"
+            html_top15 = "<p>⚠️ <b>DIFESA ATTIVA (CASH MODE):</b> Nessun titolo ha superato i test di bilancio. Portafoglio 100% Liquido.</p>"
             
         html = f"""
         <html><body>
